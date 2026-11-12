@@ -3,11 +3,11 @@ package tests
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 var (
@@ -42,15 +44,31 @@ var (
 		"",
 		"Comma separated list of patterns to use to filter the envars to pass (set to \".*\" to pass everything)",
 	)
-	notFollowRedirects = flag.Bool("client_not_follow_redirects", false, "The test http client should not follow http redirects")
+	notFollowRedirects                = flag.Bool("client_not_follow_redirects", false, "The test http client should not follow http redirects")
+	defaultStartupWait *time.Duration = flag.Duration(
+		"krakend_startup_wait",
+		1500*time.Millisecond,
+		"The time to wait to let servers startup before start testing",
+	)
+	defaultReadyURL *string = flag.String(
+		"krakend_ready_url",
+		"",
+		"The url to check for system under test readiness.",
+	)
+	defaultReadyURLWait *time.Duration = flag.Duration(
+		"krakend_ready_url_wait",
+		1500*time.Millisecond,
+		"The maximum time to wait for the ready url to return a 200 Ok response.",
+	)
 )
 
 // TestCase defines a single case to be tested
 type TestCase struct {
-	Name string `json:"name"`
-	Err  string `json:"error"`
-	In   Input  `json:"in"`
-	Out  Output `json:"out"`
+	Name string     `json:"name"`
+	Err  string     `json:"error"`
+	In   Input      `json:"in"`
+	Out  Output     `json:"out"`
+	Next []TestCase `json:"next"`
 }
 
 // Input is the definition of the request to send in a given TestCase
@@ -58,14 +76,15 @@ type Input struct {
 	URL    string            `json:"url"`
 	Method string            `json:"method"`
 	Header map[string]string `json:"header"`
-	Body   string            `json:"body"`
+	Body   interface{}       `json:"body"`
 }
 
 // Output contains the data required to verify the response received in a given TestCase
 type Output struct {
-	StatusCode int                 `json:"status_code"`
-	Body       interface{}         `json:"body"`
-	Header     map[string][]string `json:"header"`
+	StatusCode int                    `json:"status_code"`
+	Body       interface{}            `json:"body"`
+	Header     map[string][]string    `json:"header"`
+	Schema     map[string]interface{} `json:"schema"`
 }
 
 // CmdBuilder defines an interface for building the cmd to be managed by the Runner
@@ -78,6 +97,20 @@ type BackendBuilder interface {
 	New(*Config) http.Server
 }
 
+// GenericServer defines an interface to launch a server that
+// could be an http.Server, a different type, or a wrapper
+// around multiple servers.
+type GenericServer interface {
+	Close() error
+	ListenAndServe() error
+}
+
+// ComposableBackendBuilder allows us to return
+// a more generic interface for any kind of server.
+type ComposableBackendBuilder interface {
+	NewGenericServer(*Config) GenericServer
+}
+
 // Config contains options for running a test.
 type Config struct {
 	BinPath         string
@@ -87,6 +120,9 @@ type Config struct {
 	BackendPort     int
 	Delay           time.Duration
 	HttpClient      *http.Client
+	StartupWait     time.Duration
+	ReadyURL        string
+	ReadyURLWait    time.Duration
 }
 
 func (c *Config) getBinPath() string {
@@ -124,6 +160,27 @@ func (c *Config) getDelay() time.Duration {
 	return *defaultDelay
 }
 
+func (c *Config) getReadyURL() string {
+	if c.ReadyURL != "" {
+		return c.ReadyURL
+	}
+	return *defaultReadyURL
+}
+
+func (c *Config) getReadyURLWait() time.Duration {
+	if c.ReadyURLWait != 0 {
+		return c.ReadyURLWait
+	}
+	return *defaultReadyURLWait
+}
+
+func (c *Config) getStartupWait() time.Duration {
+	if c.StartupWait != 0 {
+		return c.StartupWait
+	}
+	return *defaultStartupWait
+}
+
 func (c *Config) getEnvironPatterns() string {
 	if c.EnvironPatterns != "" {
 		return c.EnvironPatterns
@@ -136,13 +193,12 @@ func (c *Config) getHttpClient() *http.Client {
 		return c.HttpClient
 	}
 	return defaultHttpClient()
-
 }
 
 func defaultHttpClient() *http.Client {
 	if *notFollowRedirects {
 		return &http.Client{
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		}
@@ -184,20 +240,29 @@ func NewIntegration(cfg *Config, cb CmdBuilder, bb BackendBuilder) (*Runner, []T
 	}
 
 	if bb == nil {
-		bb = defaultBackendBuilder
+		bb = DefaultBackendBuilder
 	}
 
-	backend := bb.New(cfg)
+	var backend GenericServer
+	cbb, ok := bb.(ComposableBackendBuilder)
+	if ok {
+		backend = cbb.NewGenericServer(cfg)
+	} else {
+		httpServer := bb.New(cfg)
+		backend = &httpServer
+	}
+
 	closeFuncs = append(closeFuncs, func() { backend.Close() })
 
 	go func() {
 		if err := backend.ListenAndServe(); err != nil {
-			log.Printf("backend closed: %v", err)
+			log.Printf("backend closed: %v\n", err)
 		}
 	}()
 
-	select {
-	case <-time.After(1500 * time.Millisecond):
+	// wait for system under test and backend server to be ready
+	if err := waitForStartup(cfg.getReadyURL(), cfg.getReadyURLWait(), cfg.getStartupWait()); err != nil {
+		return nil, tcs, err
 	}
 
 	return &Runner{
@@ -205,6 +270,50 @@ func NewIntegration(cfg *Config, cb CmdBuilder, bb BackendBuilder) (*Runner, []T
 		once:       new(sync.Once),
 		httpClient: cfg.getHttpClient(),
 	}, tcs, nil
+}
+
+// waitForStartup checks the ready endpoint if provided for the provided time
+// and then and additional startupWait time for the backend services to
+// be ready.
+func waitForStartup(readyURL string, readyURLWait, startupWait time.Duration) error {
+	if readyURL != "" {
+		return waitForReady(readyURL, readyURLWait)
+	}
+
+	if startupWait <= 0 {
+		startupWait = 1500 * time.Millisecond
+	}
+	<-time.After(startupWait)
+	return nil
+}
+
+func waitForReady(readyURL string, readyURLWait time.Duration) error {
+	if readyURLWait < time.Second {
+		readyURLWait = time.Second
+	}
+	deadline := time.Now().Add(readyURLWait)
+	resp, err := http.Get(readyURL)
+
+	for (resp == nil || resp.StatusCode != 200) && time.Now().Before(deadline) {
+		<-time.After(time.Second)
+		resp, err = http.Get(readyURL)
+	}
+
+	if resp != nil && resp.StatusCode == 200 {
+		fmt.Printf("system under test %s is ready\n", readyURL)
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("cannot check %s is ready: %s", readyURL, err.Error())
+	}
+
+	if resp != nil {
+		return fmt.Errorf("cannot check %s is ready: expecting 200 status code, got %d",
+			readyURL, resp.StatusCode)
+	}
+
+	return fmt.Errorf("cannot check %s is ready", readyURL)
 }
 
 // Runner handles the integration test execution, by dealing with the request generation, response verification
@@ -223,7 +332,6 @@ func (i *Runner) Close() {
 			closeF()
 		}
 	})
-
 }
 
 // Check runs a test case, returning an error if something goes wrong
@@ -252,7 +360,7 @@ func (m responseError) Error() string {
 	return "wrong response:\n\t" + strings.Join(m.errMessage, "\n\t")
 }
 
-func assertResponse(actual *http.Response, expected Output) error {
+func assertResponse(actual *http.Response, expected Output) error { // skipcq GO-R1005
 	var errMsgs []string
 	if actual.StatusCode != expected.StatusCode {
 		errMsgs = append(errMsgs, fmt.Sprintf("unexpected status code. have: %d, want: %d", actual.StatusCode, expected.StatusCode))
@@ -277,9 +385,17 @@ func assertResponse(actual *http.Response, expected Output) error {
 	}
 
 	var body interface{}
-
+	var bodyBytes []byte
 	if actual.Body != nil {
-		b, err := ioutil.ReadAll(actual.Body)
+		// check if the body is compressed with gzip
+		var r io.Reader = actual.Body
+		if ce, ok := actual.Header["Content-Encoding"]; ok && len(ce) > 0 && (ce[0] == "gzip" || ce[0] == "x-gzip") {
+			if gr, err := gzip.NewReader(actual.Body); err == nil {
+				r = gr
+			}
+		}
+
+		b, err := io.ReadAll(r)
 		if err != nil {
 			return err
 		}
@@ -291,10 +407,53 @@ func assertResponse(actual *http.Response, expected Output) error {
 		default:
 			_ = json.Unmarshal(b, &body)
 		}
+		bodyBytes = b
 	}
 
-	if !reflect.DeepEqual(body, expected.Body) {
-		errMsgs = append(errMsgs, fmt.Sprintf("unexpected body.\n\t\thave: %v\n\t\twant: %v", body, expected.Body))
+	if len(expected.Schema) != 0 {
+		if len(bodyBytes) == 0 {
+			return responseError{
+				errMessage: append(errMsgs, "cannot validate empty body"),
+			}
+		}
+		s, err := json.Marshal(expected.Schema)
+		if err != nil {
+			return responseError{
+				errMessage: append(errMsgs, fmt.Sprintf("problem marshaling the user provided json-schema: %s", err)),
+			}
+		}
+		doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(s))
+		if err != nil {
+			return responseError{
+				errMessage: append(errMsgs, fmt.Sprintf("problem unmarshaling the user provided json-schema: %s", err)),
+			}
+		}
+
+		c := jsonschema.NewCompiler()
+		c.AddResource("./schema.json", doc)
+		schema, err := c.Compile("./schema.json")
+		if err != nil {
+			return responseError{
+				errMessage: append(errMsgs, fmt.Sprintf("problem generating json-schema schema: %s", err)),
+			}
+		}
+
+		b, err := jsonschema.UnmarshalJSON(bytes.NewReader(bodyBytes))
+		if err != nil {
+			return responseError{
+				errMessage: append(errMsgs, fmt.Sprintf("problem unmarshaling the body: %s", err)),
+			}
+		}
+		err = schema.Validate(b)
+		if err != nil {
+			return responseError{
+				errMessage: append(errMsgs, fmt.Sprintf("problem validating the body: %s", sanitizeValidationError(err))),
+			}
+		}
+	} else if expected.Body != nil {
+		if !reflect.DeepEqual(body, expected.Body) {
+			errMsgs = append(errMsgs, fmt.Sprintf("unexpected body.\n\t\thave: %v\n\t\twant: %v", body, expected.Body))
+		}
 	}
 	if len(errMsgs) == 0 {
 		return nil
@@ -303,6 +462,16 @@ func assertResponse(actual *http.Response, expected Output) error {
 	return responseError{
 		errMessage: errMsgs,
 	}
+}
+
+func sanitizeValidationError(e error) string {
+	s := e.Error()
+	if strings.HasPrefix(s, "jsonschema validation failed with") {
+		if ss := strings.SplitN(s, "\n", 2); len(ss) == 2 {
+			return ss[1]
+		}
+	}
+	return s
 }
 
 func testCases(cfg Config) ([]TestCase, error) {
@@ -335,13 +504,27 @@ func parseTestCase(name string, in []byte) (TestCase, error) {
 
 func newRequest(in Input) (*http.Request, error) {
 	var body io.Reader
-	if in.Body != "" {
-		body = bytes.NewBufferString(in.Body)
+
+	if in.Body != nil {
+		var b []byte
+		switch in.Body.(type) {
+		case string:
+			b = []byte(in.Body.(string))
+		default:
+			b, _ = json.Marshal(in.Body)
+		}
+		body = bytes.NewBuffer(b)
 	}
+
 	req, err := http.NewRequest(in.Method, in.URL, body)
 	if err != nil {
 		return nil, err
 	}
+
+	if host, ok := in.Header["Host"]; ok {
+		req.Host = host
+	}
+
 	for k, v := range in.Header {
 		req.Header.Add(k, v)
 	}
@@ -350,7 +533,7 @@ func newRequest(in Input) (*http.Request, error) {
 
 func readSpecs(dirPath string) (map[string][]byte, error) {
 	data := map[string][]byte{}
-	files, err := ioutil.ReadDir(dirPath)
+	files, err := os.ReadDir(dirPath)
 	if err != nil {
 		return data, err
 	}
@@ -359,7 +542,7 @@ func readSpecs(dirPath string) (map[string][]byte, error) {
 		if !strings.HasSuffix(file.Name(), ".json") {
 			continue
 		}
-		content, err := ioutil.ReadFile(path.Join(dirPath, file.Name()))
+		content, err := os.ReadFile(path.Join(dirPath, file.Name()))
 		if err != nil {
 			return data, err
 		}
@@ -402,7 +585,7 @@ func (krakendCmdBuilder) getEnviron(cfg *Config) []string {
 	return environ
 }
 
-var defaultBackendBuilder mockBackendBuilder
+var DefaultBackendBuilder mockBackendBuilder
 
 type mockBackendBuilder struct{}
 
@@ -416,7 +599,7 @@ func (mockBackendBuilder) New(cfg *Config) http.Server {
 	mux.HandleFunc("/redirect/", checkXForwardedFor(http.HandlerFunc(redirectEndpoint)))
 	mux.HandleFunc("/jwk/symmetric", http.HandlerFunc(symmetricJWKEndpoint))
 
-	return http.Server{
+	return http.Server{ // skipcq: GO-S2112
 		Addr:    fmt.Sprintf(":%v", cfg.getBackendPort()),
 		Handler: mux,
 	}
@@ -471,12 +654,20 @@ func echoEndpoint(rw http.ResponseWriter, r *http.Request) {
 	rw.Header().Add("Set-Cookie", "test1=test1")
 	rw.Header().Add("Set-Cookie", "test2=test2")
 	r.Header.Del("X-Forwarded-For")
-	json.NewEncoder(rw).Encode(map[string]interface{}{
+	resp := map[string]interface{}{
 		"path":    r.URL.Path,
 		"query":   r.URL.Query(),
 		"headers": r.Header,
 		"foo":     42,
-	})
+	}
+
+	if r.URL.Query().Get("dump_body") == "1" {
+		b, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		resp["body"] = string(b)
+	}
+
+	json.NewEncoder(rw).Encode(resp)
 }
 
 func redirectEndpoint(rw http.ResponseWriter, r *http.Request) {
@@ -496,7 +687,7 @@ func redirectEndpoint(rw http.ResponseWriter, r *http.Request) {
 	http.Redirect(rw, r, u.String(), code)
 }
 
-func symmetricJWKEndpoint(rw http.ResponseWriter, req *http.Request) {
+func symmetricJWKEndpoint(rw http.ResponseWriter, _ *http.Request) {
 	rw.Header().Add("Content-Type", "application/json")
 	rw.Write([]byte(`{
   "keys": [

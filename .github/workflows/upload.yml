@@ -1,0 +1,42 @@
+on:
+  workflow_dispatch:
+    inputs:
+      cache-ref-key:
+        type: string
+        description: cache-ref-key to upload to release page
+        required: true
+      release-id:
+        type: string
+        description: release id destination
+        required: true
+
+name: Upload cache to release page
+jobs:
+  upload:
+    name: Upload release-artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      packages: write
+      checks: write
+      contents: write
+      statuses: read
+    steps:
+    - name: Restore cache
+      id: cache-restore
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          *.tar.gz
+          *.asc
+          *.deb
+          *.rpm
+          checksums.txt
+        key: ${{ github.event.inputs.cache-ref-key }}
+    - name: Upload the artifacts
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RELEASE_ID: ${{ github.event.inputs.release-id }}
+      run: |
+        TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq .tag_name)
+        gh release upload "$TAG" *.tar.gz *.asc *.deb *.rpm checksums.txt --clobber --repo "$GITHUB_REPOSITORY"

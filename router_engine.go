@@ -1,42 +1,75 @@
 package krakend
 
 import (
-	"io"
+	"encoding/json"
 
-	botdetector "github.com/devopsfaith/krakend-botdetector/gin"
-	httpsecure "github.com/devopsfaith/krakend-httpsecure/gin"
-	lua "github.com/devopsfaith/krakend-lua/router/gin"
 	"github.com/gin-gonic/gin"
-	"github.com/luraproject/lura/config"
-	"github.com/luraproject/lura/logging"
+
+	botdetector "github.com/krakend/krakend-botdetector/v3/gin"
+	httpsecure "github.com/krakend/krakend-httpsecure/v3/gin"
+	lua "github.com/krakend/krakend-lua/v3/router/gin"
+	"github.com/luraproject/lura/v3/config"
+	"github.com/luraproject/lura/v3/core"
+	luragin "github.com/luraproject/lura/v3/router/gin"
+	"github.com/luraproject/lura/v3/transport/http/server"
 )
 
 // NewEngine creates a new gin engine with some default values and a secure middleware
-func NewEngine(cfg config.ServiceConfig, logger logging.Logger, w io.Writer) *gin.Engine {
-	if !cfg.Debug {
-		gin.SetMode(gin.ReleaseMode)
+func NewEngine(cfg config.ServiceConfig, opt luragin.EngineOptions) *gin.Engine {
+	engine := luragin.NewEngine(cfg, opt)
+
+	engine.NoRoute(defaultHandler)
+	engine.NoMethod(defaultHandler)
+	if v, ok := cfg.ExtraConfig[luragin.Namespace]; ok && v != nil {
+		var ginOpts ginOptions
+		if b, err := json.Marshal(v); err == nil {
+			json.Unmarshal(b, &ginOpts)
+		}
+		if ginOpts.ErrorBody.Err404 != nil {
+			engine.NoRoute(jsonHandler(404, ginOpts.ErrorBody.Err404))
+		}
+		if ginOpts.ErrorBody.Err405 != nil {
+			engine.NoMethod(jsonHandler(405, ginOpts.ErrorBody.Err405))
+		}
 	}
 
-	engine := gin.New()
-	engine.Use(gin.LoggerWithConfig(gin.LoggerConfig{Output: w}), gin.Recovery())
-
-	engine.RedirectTrailingSlash = true
-	engine.RedirectFixedPath = true
-	engine.HandleMethodNotAllowed = true
-
-	if err := httpsecure.Register(cfg.ExtraConfig, engine); err != nil {
-		logger.Warning(err)
+	logPrefix := "[SERVICE: Gin]"
+	if err := httpsecure.Register(cfg.ExtraConfig, engine); err != nil && err != httpsecure.ErrNoConfig {
+		opt.Logger.Warning(logPrefix+"[HTTPsecure]", err)
+	} else if err == nil {
+		opt.Logger.Debug(logPrefix + "[HTTPsecure] Successfully loaded module")
 	}
 
-	lua.Register(logger, cfg.ExtraConfig, engine)
+	lua.Register(opt.Logger, cfg.ExtraConfig, engine)
 
-	botdetector.Register(cfg, logger, engine)
+	botdetector.Register(cfg, opt.Logger, engine)
 
 	return engine
 }
 
+func defaultHandler(c *gin.Context) {
+	c.Header(core.KrakendHeaderName, core.KrakendHeaderValue)
+	c.Header(server.CompleteResponseHeaderName, server.HeaderIncompleteResponseValue)
+}
+
+func jsonHandler(status int, v interface{}) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		defaultHandler(c)
+		c.JSON(status, v)
+	}
+}
+
 type engineFactory struct{}
 
-func (e engineFactory) NewEngine(cfg config.ServiceConfig, l logging.Logger, w io.Writer) *gin.Engine {
-	return NewEngine(cfg, l, w)
+func (engineFactory) NewEngine(cfg config.ServiceConfig, opt luragin.EngineOptions) *gin.Engine {
+	return NewEngine(cfg, opt)
+}
+
+type ginOptions struct {
+	// ErrorBody sets the json body to return to handlers like NoRoute (404) and NoMethod (405)
+	// Example: "404": { "error": "Not Found", "status": 404 }
+	ErrorBody struct {
+		Err404 interface{} `json:"404"`
+		Err405 interface{} `json:"405"`
+	} `json:"error_body"`
 }

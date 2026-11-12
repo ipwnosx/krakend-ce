@@ -4,16 +4,17 @@ package main
 
 import (
 	"context"
+	"embed"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
-	krakend "github.com/devopsfaith/krakend-ce"
-	"github.com/devopsfaith/krakend-cobra"
-	flexibleconfig "github.com/devopsfaith/krakend-flexibleconfig"
-	"github.com/devopsfaith/krakend-viper"
-	"github.com/luraproject/lura/config"
+	krakend "github.com/krakend/krakend-ce/v3"
+	cmd "github.com/krakend/krakend-cobra/v3"
+	flexibleconfig "github.com/krakend/krakend-flexibleconfig/v3"
+	koanf "github.com/krakend/krakend-koanf/v2"
+	"github.com/luraproject/lura/v3/config"
 )
 
 const (
@@ -23,6 +24,9 @@ const (
 	fcPath      = "FC_OUT"
 	fcEnable    = "FC_ENABLE"
 )
+
+//go:embed schema
+var embedSchema embed.FS
 
 func main() {
 	sigs := make(chan os.Signal, 1)
@@ -42,7 +46,7 @@ func main() {
 	krakend.RegisterEncoders()
 
 	var cfg config.Parser
-	cfg = viper.New()
+	cfg = koanf.New()
 	if os.Getenv(fcEnable) != "" {
 		cfg = flexibleconfig.NewTemplateParser(flexibleconfig.Config{
 			Parser:    cfg,
@@ -52,6 +56,22 @@ func main() {
 			Templates: os.Getenv(fcTemplates),
 		})
 	}
+
+	var rawSchema string
+	schema, err := embedSchema.ReadFile("schema/schema.json")
+	if err == nil {
+		rawSchema = string(schema)
+	}
+
+	commandsToLoad := []cmd.Command{
+		cmd.RunCommand,
+		cmd.NewCheckCmd(rawSchema),
+		cmd.VersionCommand,
+		cmd.AuditCommand,
+	}
+
+	cmd.DefaultRoot = cmd.NewRoot(cmd.RootCommand, commandsToLoad...)
+	cmd.DefaultRoot.Cmd.CompletionOptions.DisableDefaultCmd = true
 
 	cmd.Execute(cfg, krakend.NewExecutor(ctx))
 }
